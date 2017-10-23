@@ -1,0 +1,251 @@
+From e2a8c667b8ea70f02db45762b1e05e007e75a77f Mon Sep 17 00:00:00 2001
+From: Quadral <airhawk@hotmail.co.uk>
+Date: Mon, 4 Sep 2017 02:04:06 +0100
+Subject: [PATCH] Feed back
+
+---
+ .../Database/Implementation/CharacterDatabase.cpp  |   3 +
+ .../Database/Implementation/CharacterDatabase.h    |   2 +
+ src/server/scripts/Custom/Feedback_NPC.cpp         | 180 +++++++++++++++++++++
+ src/server/scripts/Custom/custom_script_loader.cpp |   2 +
+ 4 files changed, 187 insertions(+)
+ create mode 100644 src/server/scripts/Custom/Feedback_NPC.cpp
+
+diff --git a/src/server/database/Database/Implementation/CharacterDatabase.cpp b/src/server/database/Database/Implementation/CharacterDatabase.cpp
+index 398973a..ca5ca97 100644
+--- a/src/server/database/Database/Implementation/CharacterDatabase.cpp
++++ b/src/server/database/Database/Implementation/CharacterDatabase.cpp
+@@ -610,6 +610,9 @@ void CharacterDatabaseConnection::DoPrepareStatements()
+ 
+     // DeserterTracker
+     PrepareStatement(CHAR_INS_DESERTER_TRACK, "INSERT INTO battleground_deserters (guid, type, datetime) VALUES (?, ?, NOW())", CONNECTION_ASYNC);
++
++	// Feedback System
++	PrepareStatement(CHAR_INS_SUBMIT_FEEDBACK, "INSERT INTO Feedback_system (playerSubject, playerName, playerGUID, playerFeedback, date) VALUES (?, ?, ?, ?, NOW())", CONNECTION_ASYNC);
+ }
+ 
+ CharacterDatabaseConnection::CharacterDatabaseConnection(MySQLConnectionInfo& connInfo) : MySQLConnection(connInfo)
+diff --git a/src/server/database/Database/Implementation/CharacterDatabase.h b/src/server/database/Database/Implementation/CharacterDatabase.h
+index 8f59059..2d05c68 100644
+--- a/src/server/database/Database/Implementation/CharacterDatabase.h
++++ b/src/server/database/Database/Implementation/CharacterDatabase.h
+@@ -526,6 +526,8 @@ enum CharacterDatabaseStatements : uint32
+ 
+     CHAR_INS_DESERTER_TRACK,
+ 
++	// Feedback System
++	CHAR_INS_SUBMIT_FEEDBACK,
++
+     MAX_CHARACTERDATABASE_STATEMENTS
+ };
+ 
+diff --git a/src/server/scripts/Custom/Feedback_NPC.cpp b/src/server/scripts/Custom/Feedback_NPC.cpp
+new file mode 100644
+index 0000000..6993f90
+--- /dev/null
++++ b/src/server/scripts/Custom/Feedback_NPC.cpp
+@@ -0,0 +1,180 @@
++#include "GossipDef.h"
++#include "ScriptedGossip.h"
++#include "ScriptedCreature.h"
++#include "Player.h"
++#include "WorldSession.h"
++#include "Creature.h"
++#include "DatabaseEnv.h"
++#include <map>
++
++enum actionGossip
++{
++	GOSSIP_OPTION_MENU,				// 0
++	GOSSIP_OPTION_SUBMIT_FEEDBACK,  // 1
++	GOSSIP_OPTION_WHO_ARE_YOU,		// 2
++	GOSSIP_OPTION_TITLE_MAX			// 3
++};
++
++struct feedback_cooldown_info
++{
++	uint64 cooldownCheck;
++};
++
++static std::map<uint64, feedback_cooldown_info> feedback_cooldown;
++
++class Feedback_NPC : public CreatureScript
++{
++public:
++	Feedback_NPC() : CreatureScript("Feedback_NPC") {}
++
++	static bool insertPlayerFeedback(Player* player, std::string code, std::string title)
++	{
++		if (code.length() < 10 || code.empty()) // if less than 10 characters, then don't submit
++		{
++			player->GetSession()->SendAreaTriggerMessage("You need to submit more than 10 characters to submit feedback!");
++			CloseGossipMenuFor(player);
++			return false;
++		}
++
++		if (code.length() > 100) // if more than 100 characters, then don't submit
++		{
++			int number = 100;
++			int length = code.length() - number;
++
++			player->GetSession()->SendAreaTriggerMessage("You can only type up to 100 characters! Please remove %u characters!", length);
++			CloseGossipMenuFor(player);
++			return false;
++		}
++
++		uint64 playerGUID = player->GetGUID();
++		time_t timeNow = time(0);
++
++		std::string convertToString = std::to_string(feedback_cooldown[playerGUID].cooldownCheck - timeNow);
++
++		if (timeNow >= feedback_cooldown[playerGUID].cooldownCheck)
++		{
++			PreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_SUBMIT_FEEDBACK);
++			stmt->setString(0, title);
++			stmt->setString(1, player->GetName().c_str());
++			stmt->setUInt64(2, player->GetGUID());
++			stmt->setString(3, code);
++			CharacterDatabase.Execute(stmt);
++			feedback_cooldown[playerGUID].cooldownCheck = timeNow + 30; // 30 seconds
++
++			player->GetSession()->SendAreaTriggerMessage("You've submitted feedback! Thank you!");
++		}
++		else
++			player->GetSession()->SendAreaTriggerMessage("You must wait %s seconds in order to submit feed back again", convertToString.c_str());
++
++		CloseGossipMenuFor(player);
++		return true;
++	}
++
++	static bool OnGossipHello(Player* player, Creature* creature)
++	{
++		AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, "Who are you?", GOSSIP_SENDER_MAIN, GOSSIP_OPTION_WHO_ARE_YOU);
++		AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, "Submit Feedback", GOSSIP_SENDER_MAIN, GOSSIP_OPTION_SUBMIT_FEEDBACK);
++		SendGossipMenuFor(player, player->GetGossipTextId(creature), creature->GetGUID());
++		return true;
++	}
++
++	static bool OnGossipSelectCode(Player* player, Creature* creature, uint32 sender, uint32 action, char const* code)
++	{
++		if (!action || !player)
++			return false;
++
++		std::string title = "";
++		ClearGossipMenuFor(player);
++
++		switch (action)
++		{
++		case GOSSIP_OPTION_TITLE_MAX + 1:
++			title = "PVP";
++			insertPlayerFeedback(player, code, title);
++			break;
++		case GOSSIP_OPTION_TITLE_MAX + 2:
++			title = "PVE";
++			insertPlayerFeedback(player, code, title);
++			break;
++			break;
++		case GOSSIP_OPTION_TITLE_MAX + 3:
++			title = "Class";
++			insertPlayerFeedback(player, code, title);
++			break;
++			break;
++		case GOSSIP_OPTION_TITLE_MAX + 4:
++			title = "Exploit";
++			insertPlayerFeedback(player, code, title);
++			break;
++			break;
++		case GOSSIP_OPTION_TITLE_MAX + 5:
++			title = "Suggestion";
++			insertPlayerFeedback(player, code, title);
++			break;
++			break;
++		case GOSSIP_OPTION_TITLE_MAX + 6:
++			title = "Other";
++			insertPlayerFeedback(player, code, title);
++			break;
++
++		default:
++			break;
++		}
++
++		return true;
++	}
++
++	static bool OnGossipSelect(Player* player, Creature* creature, uint32 sender, uint32 action)
++	{
++		if (!action || !player)
++			return false;
++
++		ClearGossipMenuFor(player);
++
++		switch (action)
++		{
++	    case GOSSIP_OPTION_WHO_ARE_YOU:
++			creature->Whisper("You can submit feedback on various topics, for our admin to see and take action!", LANG_UNIVERSAL, player, false);
++			CloseGossipMenuFor(player);
++			break;
++		case GOSSIP_OPTION_SUBMIT_FEEDBACK:
++			AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, "PVP", GOSSIP_SENDER_MAIN, GOSSIP_OPTION_TITLE_MAX + 1, "", 0, true);
++			AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, "PVE", GOSSIP_SENDER_MAIN, GOSSIP_OPTION_TITLE_MAX + 2, "", 0, true);
++			AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, "Class", GOSSIP_SENDER_MAIN, GOSSIP_OPTION_TITLE_MAX + 3, "", 0, true);
++			AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, "Exploit", GOSSIP_SENDER_MAIN, GOSSIP_OPTION_TITLE_MAX + 4, "", 0, true);
++			AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, "Suggestion", GOSSIP_SENDER_MAIN, GOSSIP_OPTION_TITLE_MAX + 5, "", 0, true);
++			AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, "Other", GOSSIP_SENDER_MAIN, GOSSIP_OPTION_TITLE_MAX + 6, "", 0, true);
++			SendGossipMenuFor(player, player->GetGossipTextId(creature), creature->GetGUID());
++			break;
++		default: 
++			break; 
++		}
++
++		return true;
++	}
++
++	struct MyAI : public ScriptedAI
++	{
++		MyAI(Creature* creature) : ScriptedAI(creature) { }
++		bool GossipHello(Player* player) override
++		{
++			return OnGossipHello(player, me);
++		}
++		bool GossipSelect(Player* player, uint32 menuId, uint32 gossipListId) override
++		{
++			uint32 sender = player->PlayerTalkClass->GetGossipOptionSender(gossipListId);
++			uint32 action = player->PlayerTalkClass->GetGossipOptionAction(gossipListId);
++			return OnGossipSelect(player, me, sender, action);
++		}
++		bool GossipSelectCode(Player* player, uint32 menuId, uint32 gossipListId, char const* code) override
++		{
++			uint32 sender = player->PlayerTalkClass->GetGossipOptionSender(gossipListId);
++			uint32 action = player->PlayerTalkClass->GetGossipOptionAction(gossipListId);
++			return OnGossipSelectCode(player, me, sender, action, code);
++		}
++	};
++	CreatureAI* GetAI(Creature* creature) const override
++	{
++		return new MyAI(creature);
++	}
++};
++
++void AddSC_Feedback_NPC()
++{
++	new Feedback_NPC;
++}
+\ No newline at end of file
+diff --git a/src/server/scripts/Custom/custom_script_loader.cpp b/src/server/scripts/Custom/custom_script_loader.cpp
+index b74145a..4fddb7f 100644
+--- a/src/server/scripts/Custom/custom_script_loader.cpp
++++ b/src/server/scripts/Custom/custom_script_loader.cpp
+@@ -17,9 +17,11 @@
+ 
+ // This is where scripts' loading functions should be declared:
+ 
++void AddSC_Feedback_NPC();
+ 
+ // The name of this function should match:
+ // void Add${NameOfDirectory}Scripts()
+ void AddCustomScripts()
+ {
++	AddSC_Feedback_NPC();
+ }
+-- 
+2.10.1.windows.1
